@@ -49,7 +49,8 @@ services:
       JELLYFIN_OIDC_CLIENT_ID: ${E2E_OIDC_CLIENT_ID-jellyfin}
       JELLYFIN_OIDC_CLIENT_SECRET_FILE: /run/e2e/client-secret
       JELLYFIN_OIDC_PROVIDER_NAME: E2E IdP
-      JELLYFIN_OIDC_ALLOWED_GROUPS: jellyfin-users,jellyfin-admins
+      JELLYFIN_OIDC_ALLOWED_GROUPS: ${E2E_ALLOWED_GROUPS-jellyfin-users,jellyfin-admins}
+      JELLYFIN_OIDC_ALLOW_ANY_USER: "false"
       JELLYFIN_OIDC_ADMIN_GROUPS: jellyfin-admins
       JELLYFIN_OIDC_AUTO_CREATE_USERS: "true"
       JELLYFIN_OIDC_LINK_EXISTING_BY_USERNAME: ${E2E_LINK_EXISTING:-false}

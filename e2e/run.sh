@@ -154,29 +154,42 @@ run_phase p2 p2-nopassword.spec.ts
 export E2E_DISABLE_PASSWORD=false E2E_LINK_EXISTING=true
 run_phase p3 p3-link.spec.ts
 
-# --- misconfiguration: ENABLED=true without issuer and client id must not
-# start (or at least must never become healthy and serve logins).
-log "phase misconfig: OIDC enabled without issuer/client"
-export E2E_OIDC_ISSUER="" E2E_OIDC_CLIENT_ID="" E2E_LINK_EXISTING=false
-dc up -d --force-recreate --no-deps jellyfin || die "could not start jellyfin for misconfig"
-CID=$(dc ps -a -q jellyfin)
-verdict=""
-for _ in $(seq 1 45); do
-  state=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$CID")
-  if [[ $state == exited* ]]; then
-    code=${state#exited }
-    if [[ $code != 0 ]]; then verdict="pass: server refused to start (exit $code)"; else verdict="fail: server exited 0"; fi
-    break
-  fi
-  if dc exec -T jellyfin curl -fsS -o /dev/null http://localhost:8096/health 2>/dev/null; then
-    verdict="fail: server started and reports healthy despite invalid OIDC config"
-    break
-  fi
-  sleep 2
-done
-[[ -n "$verdict" ]] || verdict="pass: server did not become healthy within 90s"
-echo "$verdict" | tee "$RESULTS/misconfig.txt" >&2
-save_logs misconfig
+# --- misconfiguration must not start (or at least must never become healthy
+# and serve logins). Upstream keeps a failed process alive for a while before
+# exiting, so "never healthy within 90s" also counts as refusing to start.
+misconfig_case() {
+  local name=$1
+  log "phase misconfig ($name)"
+  dc up -d --force-recreate --no-deps jellyfin || die "could not start jellyfin for misconfig ($name)"
+  local cid state code verdict=""
+  cid=$(dc ps -a -q jellyfin)
+  for _ in $(seq 1 45); do
+    state=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$cid")
+    if [[ $state == exited* ]]; then
+      code=${state#exited }
+      if [[ $code != 0 ]]; then verdict="pass: refused to start (exit $code)"; else verdict="fail: exited 0"; fi
+      break
+    fi
+    if dc exec -T jellyfin curl -fsS -o /dev/null http://localhost:8096/health 2>/dev/null; then
+      verdict="fail: started and reports healthy"
+      break
+    fi
+    sleep 2
+  done
+  [[ -n "$verdict" ]] || verdict="pass: not healthy within 90s"
+  echo "$name: $verdict" >&2
+  save_logs "misconfig-$name"
+  MISCONFIG+=("$name: $verdict")
+}
+MISCONFIG=()
+export E2E_LINK_EXISTING=false
+E2E_OIDC_ISSUER="" E2E_OIDC_CLIENT_ID="" misconfig_case no-issuer-or-client
+E2E_ALLOWED_GROUPS="" misconfig_case no-allowed-groups
+if printf '%s\n' "${MISCONFIG[@]}" | grep -q ': fail'; then
+  printf 'fail: %s\n' "${MISCONFIG[*]}" > "$RESULTS/misconfig.txt"
+else
+  printf 'pass: %s\n' "${MISCONFIG[*]}" > "$RESULTS/misconfig.txt"
+fi
 dc logs --no-color idp > "$RESULTS/idp.log" 2>&1 || true
 
 log "summary"

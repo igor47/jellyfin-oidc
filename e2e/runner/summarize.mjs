@@ -38,7 +38,7 @@ rows.push({ file: 'run.sh', title: '@base jellyfin container trusts the IdP cert
 
 const mis = path.join(dir, 'misconfig.txt');
 const misResult = fs.existsSync(mis) ? fs.readFileSync(mis, 'utf8').trim() : 'not run';
-rows.push({ file: 'run.sh', title: '@oidc ENABLED=true without issuer/client is a startup error', passed: misResult.startsWith('pass'), status: misResult, error: '' });
+rows.push({ file: 'run.sh', title: '@oidc invalid OIDC config (no issuer/client; no allowed groups) is a startup error', passed: misResult.startsWith('pass'), status: misResult, error: '' });
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
 for (const r of rows) {
