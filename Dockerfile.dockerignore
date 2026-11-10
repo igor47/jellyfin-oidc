@@ -1,0 +1,10 @@
+# Used by BuildKit when building with -f /path/to/this/Dockerfile: the build
+# context is a patch-branch checkout, and this file applies to it.
+.git
+.github
+**/bin
+**/obj
+**/.vs
+**/.idea
+**/node_modules
+**/TestResults
