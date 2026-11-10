@@ -1,4 +1,4 @@
-# Build, unit tests and e2e for a patch-branch commit. Never publishes.
+# Build, unit tests and e2e gate for a patch-branch commit. Never publishes.
 #
 # Triggers:
 # - push / PR on oidc/** branches: those branches carry no workflows of their
