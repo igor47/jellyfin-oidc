@@ -247,6 +247,7 @@ jobs:
     needs: [prepare, resolve]
     if: >-
       always() && needs.prepare.result == 'success' &&
+      (needs.prepare.outputs.action == 'replay' || needs.prepare.outputs.action == 'release') &&
       (needs.prepare.outputs.replay_rc == '0' || needs.resolve.result == 'success')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
