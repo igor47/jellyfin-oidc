@@ -45,6 +45,12 @@ test.beforeAll(async () => {
     }
     s = saveState({ localUsers });
   }
+  // A session the local erin holds before OIDC adopts her account in phase 3.
+  if (!s.erinLocalToken) {
+    const r = await passwordLogin(rc, 'erin', 'local-erin-pw', 'e2e-erin-local-session');
+    expect(r.status(), short(await r.text())).toBe(200);
+    s = saveState({ erinLocalToken: (await r.json()).AccessToken });
+  }
 
   // Operator branding, which the fork must preserve and must not rewrite.
   const b = await call(rc, 'POST', '/System/Configuration/branding', {
@@ -211,10 +217,9 @@ test('@oidc LINK_EXISTING_BY_USERNAME=false does not adopt an existing local use
   const rc = await api();
   const localDave = loadState().localUsers!.dave;
   const r = await oidcLogin(browser, 'dave', { expectSuccess: false });
-  if (r.token) {
-    const u = await me(rc, r.token);
-    expect(u.Id, 'OIDC dave must not be the pre-existing local dave').not.toBe(localDave);
-  }
+  // The existing local user with the same name blocks the login (contract:
+  // refused until an admin renames/removes the local account).
+  expect(r.token, 'no session for OIDC dave while a local dave exists').toBeNull();
   // The local user is untouched and still has its password.
   const users = await listUsers(rc, loadState().adminToken!);
   expect(users.find((u) => u.Id === localDave)?.Name).toBe('dave');

@@ -33,6 +33,7 @@ export type State = {
   adminId?: string;
   apiKey?: string;
   localUsers?: Record<string, string>; // name -> id, created by the admin in phase 1
+  erinLocalToken?: string; // erin's own password session, from before her account is adopted (phase 3)
 };
 
 export function loadState(): State {
@@ -203,7 +204,14 @@ export async function oidcLogin(browser: Browser, user: IdpUser, opts: { expectS
     await expect
       .poll(async () => (await webClientSession(page))?.token ?? null, { timeout: 30_000, message: 'web client session token' })
       .not.toBeNull();
-    await expect(page.locator('.headerUserButton:not(.hide)').first(), 'logged-in header').toBeVisible({ timeout: 30_000 });
+    // User menu button: modern layout (default in 12.x) or legacy layout.
+    // Both headers exist in the DOM; only the active layout's is visible.
+    const userMenu = page
+      .locator('button[aria-controls="app-user-menu"], .headerUserButton:not(.hide)')
+      .filter({ visible: true })
+      .first();
+    await expect(userMenu, 'logged-in header (user menu button)').toBeVisible({ timeout: 30_000 });
+    expect(page.url(), 'web client left the login page').not.toMatch(/login/i);
     session = await webClientSession(page);
   } else {
     await page.waitForLoadState('networkidle');
