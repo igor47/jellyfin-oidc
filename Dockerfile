@@ -59,15 +59,18 @@ RUN --mount=type=cache,id=jellyfin-oidc-nuget,target=/root/.nuget/packages \
 FROM source AS test
 ARG TEST_PROJECTS=""
 ARG TEST_FILTER=""
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# `dotnet test` exits 0 when a filter matches nothing; treat that as failure.
 RUN --mount=type=cache,id=jellyfin-oidc-nuget,target=/root/.nuget/packages \
     set -e; \
     if [ -z "${TEST_PROJECTS}" ]; then echo "TEST_PROJECTS is empty" >&2; exit 1; fi; \
     for p in ${TEST_PROJECTS}; do \
       echo "::: dotnet test ${p} filter='${TEST_FILTER}'"; \
-      if [ -n "${TEST_FILTER}" ]; then \
-        dotnet test "${p}" --configuration Release --logger "console;verbosity=normal" --filter "${TEST_FILTER}"; \
-      else \
-        dotnet test "${p}" --configuration Release --logger "console;verbosity=normal"; \
+      args=(--configuration Release --logger "console;verbosity=normal"); \
+      if [ -n "${TEST_FILTER}" ]; then args+=(--filter "${TEST_FILTER}"); fi; \
+      dotnet test "${p}" "${args[@]}" 2>&1 | tee /tmp/test.log; \
+      if grep -q "No test matches" /tmp/test.log || ! grep -qE "Total tests: [1-9]" /tmp/test.log; then \
+        echo "::: no tests ran for ${p} (filter '${TEST_FILTER}')" >&2; exit 1; \
       fi; \
     done
 
