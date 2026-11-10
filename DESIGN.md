@@ -34,8 +34,11 @@ network) but containing upstream history.
   Local checkout: `/home/igor47/repos/jellyfin-oidc` (currently `oidc/v12.4`).
 - Tags / releases: `vX.Y-oidc.N` (N starts at 1, bumps for fork-only fixes).
 - Image tags: `X.Y-oidc.N`, `X.Y`, `latest`.
-- Upstream's own `.github/` must not run in this repo: patch branches carry no
-  upstream workflows (handled so that it never causes a rebase conflict).
+- Upstream's own `.github/` must not run in this repo. Each patch branch ends
+  with a regenerated commit that removes upstream's `.github/` and adds a stub
+  workflow calling `build.yml` on `main`; the replay skips that commit, so it
+  never causes a conflict. Upstream's own tags are never pushed here (a pushed
+  tag would run the tagged commit's upstream workflows).
 
 ## Server behaviour (the patch)
 
@@ -46,7 +49,7 @@ network) but containing upstream history.
 | `JELLYFIN_OIDC_ENABLED` | `false` | Master switch. |
 | `JELLYFIN_OIDC_ISSUER` | | Issuer URL; discovery at `<issuer>/.well-known/openid-configuration`. |
 | `JELLYFIN_OIDC_CLIENT_ID` | | |
-| `JELLYFIN_OIDC_CLIENT_SECRET` | | Confidential client secret. |
+| `JELLYFIN_OIDC_CLIENT_SECRET` | | Confidential client secret. Required (or the `_FILE` form); public clients are not supported. |
 | `JELLYFIN_OIDC_CLIENT_SECRET_FILE` | | Alternative: path to a file holding the secret. |
 | `JELLYFIN_OIDC_SCOPES` | `openid profile email` | Space separated. |
 | `JELLYFIN_OIDC_USERNAME_CLAIM` | `preferred_username` | Claim used as the Jellyfin username for new or linked users. |
@@ -57,7 +60,8 @@ network) but containing upstream history.
 | `JELLYFIN_OIDC_LINK_EXISTING_BY_USERNAME` | `false` | On first login, adopt an existing Jellyfin user with the same username (case-insensitive). Off by default: it is account takeover if IdP usernames are self-chosen. |
 | `JELLYFIN_OIDC_PROVIDER_NAME` | `SSO` | Button label: "Sign in with <name>". |
 | `JELLYFIN_OIDC_DISABLE_PASSWORD_LOGIN` | `false` | Reject all username/password authentication. |
-| `JELLYFIN_OIDC_REDIRECT_BASE_URL` | (derived) | External base URL, e.g. `https://jellyfin.example.org`. If unset, use Jellyfin's published server URL, else the request's scheme/host. |
+| `JELLYFIN_OIDC_REDIRECT_BASE_URL` | (published server URL) | External base URL, e.g. `https://jellyfin.example.org`. If unset, Jellyfin's published server URL is used. One of the two is required; the base is never derived from the request's Host header. |
+| `JELLYFIN_OIDC_ALLOW_ANY_USER` | `false` | Required to be `true` to start with `AUTO_CREATE_USERS=true` and no `ALLOWED_GROUPS`, i.e. to let anyone the IdP authenticates get an account. |
 
 Invalid configuration with `ENABLED=true` (missing issuer or client) must be a
 loud startup error, not a silent fallback to password login.
@@ -99,6 +103,18 @@ time (the operator's stored branding is not modified):
   password login is enabled, unless an administrator sets one.
 - Do not depend on `email_verified`. (Authentik's default email mapping
   hardcodes it to false.)
+- Users created or linked by OIDC get a random password, never an empty one, so
+  they stay locked if the provider setting is lost (e.g. on stock Jellyfin).
+- Adopting an existing user (`LINK_EXISTING_BY_USERNAME`) revokes that user's
+  existing sessions and replaces its password.
+- A linked identity that is denied at login has its Jellyfin sessions revoked.
+  A link to a deleted Jellyfin user is refused, not re-created; the operator
+  removes the entry from `oidc-links.json` to allow it.
+- Known limit: Jellyfin tokens do not expire, so removing someone at the IdP
+  does not end sessions they already have. Revoke by disabling the user in
+  Jellyfin.
+- Login state between `/oidc/login` and `/oidc/callback` lives in an encrypted
+  cookie, not on the server, so unauthenticated requests cannot exhaust it.
 
 ## Gate for automated releases
 
