@@ -27,11 +27,9 @@ network) but containing upstream history.
 
 - `main` (default branch, orphan, never force-pushed): automation only.
   Workflows, rebase/release scripts, Dockerfile, e2e harness, README, this file.
-  Local worktree: `/home/igor47/repos/jellyfin-oidc-automation`.
 - `oidc/vX.Y` (one branch per upstream release): upstream tag `vX.Y` plus the
   fork's patch commits. Never force-pushed; a new upstream release gets a new
   branch made by replaying the patch series on the new tag.
-  Local checkout: `/home/igor47/repos/jellyfin-oidc` (currently `oidc/v12.4`).
 - Tags / releases: `vX.Y-oidc.N` (N starts at 1, bumps for fork-only fixes).
 - Image tags: `X.Y-oidc.N`, `X.Y`, `latest`.
 - Upstream's own `.github/` must not run in this repo. Each patch branch ends
