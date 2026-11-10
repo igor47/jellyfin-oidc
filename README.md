@@ -311,6 +311,10 @@ The first patch branch is pushed by hand. Two things matter:
   fork's own `vX.Y-oidc.N` tags point at commits that carry only the CI stub,
   so they are safe.
 
+- A container package first pushed to ghcr.io with a personal token is created
+  private. Make it public once, in the package's settings on GitHub ("Change
+  visibility"); later pushes keep that setting.
+
 Then run the "upstream release" workflow by hand (or wait for the schedule):
 it gates and publishes `v12.4-oidc.1`.
 
