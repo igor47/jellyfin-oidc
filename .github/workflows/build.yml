@@ -1,0 +1,106 @@
+# Build, unit tests and e2e for a patch-branch commit. Never publishes.
+#
+# Triggers:
+# - push / PR on oidc/** branches: those branches carry no workflows of their
+#   own except the generated stub .github/workflows/ci.yml, which calls this
+#   file on main via workflow_call (push events run the workflow file of the
+#   pushed commit, so a workflow on main alone would never see them).
+# - push / PR on main touching the automation: gates the newest patch branch
+#   with the changed Dockerfile / e2e / scripts.
+# - workflow_dispatch: gate any patch branch by hand. (Re-releasing a branch is
+#   done with the "upstream release" workflow's `branch` input, so that all
+#   publishing happens in one workflow under one concurrency group.)
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      src_ref:
+        description: "Patch-branch commit to gate (set by the stub on oidc/** branches)."
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Patch branch to gate, e.g. oidc/v12.4. Empty = newest."
+        required: false
+        default: ""
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - Dockerfile.dockerignore
+      - e2e/**
+      - scripts/**
+      - .github/workflows/build.yml
+
+permissions: {}
+
+env:
+  STATE: ${{ github.workspace }}/state
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    concurrency:
+      group: build-${{ inputs.src_ref || inputs.branch || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Called from a patch branch: use main's automation. Otherwise: this commit's.
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.src_ref && 'main' || github.sha }}
+          path: automation
+          persist-credentials: false
+      - name: Checkout fork (all branches and tags)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Pick the commit to gate
+        id: target
+        env:
+          SRC_REF: ${{ inputs.src_ref }}
+          IN_BRANCH: ${{ inputs.branch }}
+        run: |
+          if [[ -n "$SRC_REF" ]]; then
+            git -C src fetch --no-tags origin "$SRC_REF"
+            ref=$(git -C src rev-parse FETCH_HEAD)
+          elif [[ -n "$IN_BRANCH" ]]; then
+            ref=$(git -C src rev-parse "refs/remotes/origin/$IN_BRANCH")
+          else
+            newest=$(git -C src for-each-ref --format='%(refname:strip=3)' 'refs/remotes/origin/oidc/' \
+                     | sort -V | tail -1)
+            if [[ -z "$newest" ]]; then echo "::error::no oidc/* branch to gate"; exit 1; fi
+            echo "gating newest patch branch $newest"
+            ref=$(git -C src rev-parse "refs/remotes/origin/$newest")
+          fi
+          # Upstream tags, for the version and the unit-test diff base.
+          git -C src fetch --no-tags https://github.com/jellyfin/jellyfin.git '+refs/tags/v*:refs/tags/v*'
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - name: Gate (build, unit tests, e2e)
+        env:
+          REF: ${{ steps.target.outputs.ref }}
+        run: |
+          python3 automation/scripts/release.py --repo src --state-dir "$STATE" \
+            --tmpdir "$RUNNER_TEMP" gate --ref "$REF" --results "$STATE/e2e-results"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gate-results
+          path: |
+            state/*.log
+            state/e2e-results/
+          retention-days: 14
+          if-no-files-found: ignore
