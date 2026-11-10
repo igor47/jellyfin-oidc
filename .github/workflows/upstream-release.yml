@@ -1,0 +1,465 @@
+# Follows upstream Jellyfin releases: replays the OIDC patch series onto each
+# new upstream release tag, gates it (build, unit tests, e2e) and publishes.
+# Also re-releases an existing patch branch on demand (vX.Y-oidc.N+1).
+#
+# Jobs:            prepare -> [resolve] -> gate -> publish ; report (on failure)
+# Privileges:      only `publish` can write contents/packages; only `report`
+#                  can write issues; `resolve` (Claude) is read-only and has
+#                  no credentials in its checkouts.
+# Pushes to the repo need a token with the `workflows` permission, because
+# upstream's history touches .github/workflows: see README "Secrets".
+name: upstream release
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream version to release (e.g. 12.5). Empty = latest stable."
+        required: false
+        default: ""
+      branch:
+        description: "Re-release an existing patch branch instead (e.g. oidc/v12.4)."
+        required: false
+        default: ""
+      publish:
+        description: "Publish after a green gate (false = stop after the gate)."
+        type: boolean
+        default: true
+
+permissions: {}
+
+# One release pipeline at a time; never cancel one half-way through publishing.
+concurrency:
+  group: jellyfin-oidc-release
+  cancel-in-progress: false
+
+env:
+  JFO_IMAGE_REPO: ghcr.io/${{ github.repository }}
+  JFO_GITHUB_REPO: ${{ github.repository }}
+  STATE: ${{ github.workspace }}/state
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      version: ${{ steps.plan.outputs.version }}
+      branch: ${{ steps.plan.outputs.branch }}
+      fork_tag: ${{ steps.plan.outputs.fork_tag }}
+      replay_rc: ${{ steps.replay.outputs.rc }}
+      has_claude: ${{ steps.secrets.outputs.has_claude }}
+    steps:
+      - name: Checkout automation (this branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: automation
+          persist-credentials: false
+      - name: Checkout fork (all branches and tags)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Git identity
+        run: |
+          git -C src config user.name "jellyfin-oidc automation"
+          git -C src config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - id: secrets
+        name: Which optional secrets exist
+        env:
+          HAS_CLAUDE: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: echo "has_claude=$HAS_CLAUDE" >> "$GITHUB_OUTPUT"
+      - id: plan
+        name: Plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_BRANCH: ${{ inputs.branch }}
+        run: |
+          args=()
+          if [[ -n "$IN_BRANCH" ]]; then args+=(--branch "$IN_BRANCH");
+          elif [[ -n "$IN_VERSION" ]]; then args+=(--version "$IN_VERSION"); fi
+          python3 automation/scripts/release.py --repo src --state-dir "$STATE" plan "${args[@]}"
+      - id: replay
+        name: Replay patch series / finalize branch
+        if: steps.plan.outputs.action == 'replay' || steps.plan.outputs.action == 'release'
+        env:
+          ACTION: ${{ steps.plan.outputs.action }}
+        run: |
+          rc=0
+          if [[ "$ACTION" == replay ]]; then
+            python3 automation/scripts/release.py --repo src --state-dir "$STATE" replay || rc=$?
+          else
+            python3 automation/scripts/release.py --repo src --state-dir "$STATE" finalize || rc=$?
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          case $rc in
+            0) echo "branch ready" ;;
+            3) echo "::warning::replay stopped on a conflict"; cat "$STATE/conflict.json" ;;
+            *) echo "::error::replay/finalize failed with exit $rc"; exit "$rc" ;;
+          esac
+      - name: Bundle the branch
+        if: steps.replay.outputs.rc == '0'
+        env:
+          BRANCH: ${{ steps.plan.outputs.branch }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: git -C src bundle create "$STATE/branch.bundle" "refs/heads/$BRANCH" "^v$VERSION"
+      - name: Upload state
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: prepare-state
+          path: state/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Only when the replay conflicted AND the Claude token is configured.
+  resolve:
+    needs: prepare
+    if: needs.prepare.outputs.replay_rc == '3' && needs.prepare.outputs.has_claude == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: automation
+          persist-credentials: false
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reproduce the conflict
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git -C src config user.name "jellyfin-oidc automation"
+          git -C src config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 automation/scripts/release.py --repo src --state-dir "$STATE" plan --version "$VERSION"
+          rc=0
+          python3 automation/scripts/release.py --repo src --state-dir "$STATE" replay || rc=$?
+          if [[ $rc != 3 ]]; then echo "::error::expected the replay to conflict (exit 3), got $rc"; exit 1; fi
+      - name: Claude resolves the conflict
+        uses: anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Read-only token (this job has contents: read only).
+          github_token: ${{ github.token }}
+          # The transcript is in the (public) run log. Acceptable here: the only
+          # secret in this job is the OAuth token, which Actions masks, and the
+          # transcript is how a failed resolution gets debugged.
+          show_full_output: true
+          claude_args: >-
+            --model claude-opus-5-5
+            --max-turns 400
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git -C src status:*),Bash(git -C src diff:*),Bash(git -C src log:*),Bash(git -C src show:*),Bash(git -C src blame:*),Bash(git -C src grep:*),Bash(git -C src ls-files:*),Bash(git -C src merge-base:*),Bash(git -C src add:*),Bash(git -C src rm:*),Bash(git -C src commit:*),Bash(python3 automation/scripts/release.py --repo src --state-dir state continue),Bash(python3 automation/scripts/release.py --repo src --state-dir state gate),Bash(docker logs:*),Bash(docker ps:*)"
+            --disallowedTools "Agent,WebFetch,WebSearch,ScheduleWakeup,CronCreate,Bash(git push:*),Bash(git -C src push:*),Bash(gh:*)"
+          prompt: |
+            You are resolving a conflict in the automated rebase of jellyfin-oidc, an
+            unofficial fork of Jellyfin Server (GPL-2.0) that adds OpenID Connect login.
+
+            Read first: automation/DESIGN.md (the binding design contract) and the
+            "Automated rebase" section of automation/README.md.
+
+            Situation: the fork's patch series is being cherry-picked from the previous
+            patch branch onto the new upstream release tag v${{ needs.prepare.outputs.version }}
+            in the git checkout at src/ (branch ${{ needs.prepare.outputs.branch }}).
+            The cherry-pick stopped on a conflict. Details (commit, conflicted files,
+            remaining commits) are in state/conflict.json; the plan is in state/plan.json.
+
+            Your job:
+            1. Resolve each conflict in src/ so the patch keeps exactly its behaviour,
+               with the smallest possible diff to upstream files. Take upstream's new
+               code as the base and re-apply the fork's intent (DESIGN.md principle 1:
+               fork code lives in new files, upstream files only get minimal hooks).
+               Do not change behaviour, endpoints, configuration or env vars.
+            2. `git -C src add <files>`, then run
+               `python3 automation/scripts/release.py --repo src --state-dir state continue`.
+               Exit 3 means the next commit conflicted too: repeat. Exit 0 means the
+               series is complete and the branch was finalized.
+            3. Run the gate:
+               `python3 automation/scripts/release.py --repo src --state-dir state gate`
+               (image build, the fork's unit tests, the end-to-end OIDC test). Logs:
+               state/build.log, state/unit.log, state/e2e.log, state/e2e-results/.
+               If upstream changed an API the patch uses, adapt the patch in an
+               additional small commit (`git -C src commit`) whose message explains why.
+               Iterate until the gate exits 0.
+            Rules: never skip or drop a patch commit; never weaken, skip or delete a
+            test; never edit anything under automation/ (the Dockerfile and the e2e
+            suite are the referee and are re-checked out fresh afterwards). You have no
+            credentials: you cannot push or publish. After you finish, the workflow
+            re-runs the complete gate itself and publishes only if it passes.
+
+            Run one command per Bash call, from the workspace root, exactly as written
+            above (no `cd`, `&&`, `;` or pipes: the permission rules deny them).
+
+            Finally write claude-report.md in the workspace root: for each conflict,
+            what upstream changed and how you resolved it; then either "GATE GREEN" or,
+            if you could not get the gate green, what still fails (with the relevant
+            log excerpt) and what a human needs to decide. The workflow posts this
+            report on the release issue or in the run summary.
+      - name: Check the result independently of Claude
+        env:
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if [[ -f claude-report.md ]]; then
+            cat claude-report.md >> "$GITHUB_STEP_SUMMARY"
+            cp claude-report.md "$STATE/claude-report.md"
+          fi
+          gd=$(git -C src rev-parse --absolute-git-dir)
+          if [[ -e "$gd/CHERRY_PICK_HEAD" || -e "$gd/sequencer" ]]; then
+            echo "::error::the cherry-pick sequence is still in progress"; exit 1
+          fi
+          git -C src rev-parse --verify "refs/heads/$BRANCH"
+          # Idempotent; also refuses a dirty tree.
+          python3 automation/scripts/release.py --repo src --state-dir "$STATE" finalize
+          git -C src bundle create "$STATE/branch.bundle" "refs/heads/$BRANCH" "^v$VERSION"
+      - name: Upload resolved state
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: resolve-state
+          path: |
+            state/plan.json
+            state/conflict.json
+            state/branch.bundle
+            state/claude-report.md
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The gate always runs on a fresh checkout of the automation and the branch
+  # from a bundle: whatever Claude claimed, this decides.
+  gate:
+    needs: [prepare, resolve]
+    if: >-
+      always() && needs.prepare.result == 'success' &&
+      (needs.prepare.outputs.replay_rc == '0' || needs.resolve.result == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: automation
+          persist-credentials: false
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download branch (from prepare)
+        if: needs.prepare.outputs.replay_rc == '0'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: prepare-state
+          path: state
+      - name: Download branch (from resolve)
+        if: needs.prepare.outputs.replay_rc != '0'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: resolve-state
+          path: state
+      - name: Import branch
+        env:
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          git -C src fetch --no-tags https://github.com/jellyfin/jellyfin.git "+refs/tags/v$VERSION:refs/tags/v$VERSION"
+          git -C src fetch "$STATE/branch.bundle" "+refs/heads/$BRANCH:refs/heads/$BRANCH"
+          rm -f "$STATE/conflict.json" "$STATE/gate.json"
+      - name: Gate (build, unit tests, e2e)
+        run: |
+          python3 automation/scripts/release.py --repo src --state-dir "$STATE" \
+            --tmpdir "$RUNNER_TEMP" gate --results "$STATE/e2e-results"
+      - name: Save tested image
+        run: |
+          image=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"])' "$STATE/gate.json")
+          docker save "$image" | zstd -T0 -3 -o "$STATE/image.tar.zst"
+      - name: Upload gate results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gate-results
+          path: |
+            state/*.log
+            state/e2e-results/
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: Upload tested state + image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gated
+          path: |
+            state/plan.json
+            state/gate.json
+            state/branch.bundle
+            state/image.tar.zst
+          retention-days: 3
+          compression-level: 0
+
+  publish:
+    needs: [prepare, gate]
+    if: needs.gate.result == 'success' && (github.event_name == 'schedule' || inputs.publish)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write   # tag, branch, GitHub release
+      packages: write   # ghcr.io image
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: automation
+          persist-credentials: false
+      - name: Checkout fork (with push credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          fetch-depth: 0
+          # GITHUB_TOKEN cannot push commits that touch .github/workflows (and
+          # upstream's history does); a fine-grained PAT with contents+workflows
+          # write on this repo can. Falls back to GITHUB_TOKEN (push will fail
+          # and an issue is opened).
+          token: ${{ secrets.RELEASE_PUSH_TOKEN || github.token }}
+      - name: Download tested state + image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gated
+          path: gated
+      - name: Import branch and image
+        env:
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p "$STATE"
+          # upload-artifact strips the common prefix; find the files wherever they landed.
+          cp "$(find gated -name plan.json)" "$(find gated -name gate.json)" "$(find gated -name branch.bundle)" "$STATE/"
+          git -C src config user.name "jellyfin-oidc automation"
+          git -C src config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C src fetch --no-tags https://github.com/jellyfin/jellyfin.git "+refs/tags/v$VERSION:refs/tags/v$VERSION"
+          git -C src fetch "$STATE/branch.bundle" "+refs/heads/$BRANCH:refs/heads/$BRANCH"
+          zstd -dc "$(find gated -name image.tar.zst)" | docker load
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish (verifies the image and commit are the gated ones)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 automation/scripts/release.py --repo src --state-dir "$STATE" \
+            --tmpdir "$RUNNER_TEMP" publish
+          echo "Published $(python3 -c 'import json; print(json.load(open("state/plan.json"))["fork_tag"])')" >> "$GITHUB_STEP_SUMMARY"
+
+  report:
+    needs: [prepare, resolve, gate, publish]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - name: Download state
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "*-state"
+          path: artifacts
+        continue-on-error: true  # absent when prepare failed early
+      - name: Open, update or close the release issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ACTION: ${{ needs.prepare.outputs.action }}
+          FORK_TAG: ${{ needs.prepare.outputs.fork_tag }}
+          REPLAY_RC: ${{ needs.prepare.outputs.replay_rc }}
+          HAS_CLAUDE: ${{ needs.prepare.outputs.has_claude }}
+          R_PREPARE: ${{ needs.prepare.result }}
+          R_RESOLVE: ${{ needs.resolve.result }}
+          R_GATE: ${{ needs.gate.result }}
+          R_PUBLISH: ${{ needs.publish.result }}
+        run: |
+          set -euo pipefail
+          label=release-automation
+          title="Release automation needs attention: upstream v${VERSION:-unknown}"
+          existing=$(gh issue list --state open --label "$label" --search "in:title \"$title\"" --json number,title \
+                     --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+
+          problem=""
+          if [[ "$R_PREPARE" != success ]]; then problem="The prepare job (plan/replay) failed."
+          elif [[ "$REPLAY_RC" == 3 && "$HAS_CLAUDE" != true ]]; then
+            problem="The patch series does not apply cleanly to v$VERSION, and CLAUDE_CODE_OAUTH_TOKEN is not configured, so nobody tried to resolve it."
+          elif [[ "$REPLAY_RC" == 3 && "$R_RESOLVE" != success ]]; then
+            problem="The patch series does not apply cleanly to v$VERSION and the automated resolution did not finish."
+          elif [[ "$R_GATE" == failure || "$R_GATE" == cancelled ]]; then
+            problem="The release gate (build, unit tests or e2e) failed for $FORK_TAG. Nothing was published."
+          elif [[ "$R_PUBLISH" == failure || "$R_PUBLISH" == cancelled ]]; then
+            problem="Publishing $FORK_TAG failed after a green gate (see the run; a re-run resumes idempotently)."
+          fi
+
+          if [[ -z "$problem" ]]; then
+            if [[ "$R_PUBLISH" == success && -n "$existing" ]]; then
+              gh issue close "$existing" --comment "Released $FORK_TAG in $RUN_URL."
+            fi
+            echo "nothing to report (action=${ACTION:-?})"
+            exit 0
+          fi
+
+          body=$(mktemp)
+          {
+            echo "$problem"
+            echo
+            echo "- Run: $RUN_URL"
+            echo "- Plan: action=\`${ACTION:-?}\` tag=\`${FORK_TAG:-?}\`"
+            echo "- Jobs: prepare=$R_PREPARE resolve=$R_RESOLVE gate=$R_GATE publish=$R_PUBLISH"
+            conflict=$(find artifacts -name conflict.json 2>/dev/null | head -1)
+            if [[ -n "$conflict" ]]; then
+              echo; echo "### Conflict"; echo; echo '```json'; cat "$conflict"; echo '```'
+              echo
+              echo "To resolve by hand: see README, \"When the replay conflicts\"."
+            fi
+            report=$(find artifacts -name claude-report.md 2>/dev/null | head -1)
+            if [[ -n "$report" ]]; then
+              echo; echo "### Claude's report"; echo; cat "$report"
+            fi
+          } > "$body"
+
+          gh label create "$label" --force --color B60205 --description "Automated release needs a human"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body-file "$body"
+          else
+            gh issue create --title "$title" --label "$label" --body-file "$body"
+          fi
+
+  # GitHub disables scheduled workflows after 60 days without repository
+  # activity. Re-enabling this workflow through the API on a schedule keeps it
+  # alive (see README: the owner is also emailed before it is disabled).
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh api -X PUT "repos/$GH_REPO/actions/workflows/upstream-release.yml/enable"
