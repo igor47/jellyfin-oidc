@@ -401,6 +401,9 @@ jobs:
           R_PUBLISH: ${{ needs.publish.result }}
         run: |
           set -euo pipefail
+          # Absent when prepare failed before uploading; `find` on a missing
+          # directory would abort this script under pipefail.
+          mkdir -p artifacts
           label=release-automation
           title="Release automation needs attention: upstream v${VERSION:-unknown}"
           existing=$(gh issue list --state open --label "$label" --search "in:title \"$title\"" --json number,title \
