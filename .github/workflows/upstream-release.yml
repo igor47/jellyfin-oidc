@@ -1,4 +1,4 @@
-# Follows upstream Jellyfin releases: replays the OIDC patch series onto each
+# Follows upstream Jellyfin (jellyfin/jellyfin) releases: replays the OIDC patch series onto each
 # new upstream release tag, gates it (build, unit tests, e2e) and publishes.
 # Also re-releases an existing patch branch on demand (vX.Y-oidc.N+1).
 #
