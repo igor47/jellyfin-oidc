@@ -60,6 +60,10 @@ FROM source AS test
 ARG TEST_PROJECTS=""
 ARG TEST_FILTER=""
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# Jellyfin.Server.Integration.Tests needs fontconfig (SkiaSharp).
+RUN apt-get update \
+ && apt-get install --no-install-recommends --yes libfontconfig1 \
+ && rm -rf /var/lib/apt/lists/*
 # `dotnet test` exits 0 when a filter matches nothing; treat that as failure.
 RUN --mount=type=cache,id=jellyfin-oidc-nuget,target=/root/.nuget/packages \
     set -e; \
