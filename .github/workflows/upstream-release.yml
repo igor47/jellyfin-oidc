@@ -105,7 +105,9 @@ jobs:
             *) echo "::error::replay/finalize failed with exit $rc"; exit "$rc" ;;
           esac
       - name: Bundle the branch
-        if: steps.replay.outputs.rc == '0'
+        # outcome check: when the replay step is skipped (plan = noop) its
+        # output is null, and null == '0' is true in Actions expressions.
+        if: steps.replay.outcome == 'success' && steps.replay.outputs.rc == '0'
         env:
           BRANCH: ${{ steps.plan.outputs.branch }}
           VERSION: ${{ steps.plan.outputs.version }}
