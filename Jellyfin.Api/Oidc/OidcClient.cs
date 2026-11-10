@@ -111,7 +111,7 @@ public class OidcClient
             ["scope"] = string.Join(' ', _options.Scopes),
             ["state"] = login.State,
             ["nonce"] = login.Nonce,
-            ["code_challenge"] = OidcStateStore.CodeChallenge(login.CodeVerifier),
+            ["code_challenge"] = OidcLoginProtector.CodeChallenge(login.CodeVerifier),
             ["code_challenge_method"] = "S256"
         });
 
@@ -222,6 +222,11 @@ public class OidcClient
         var algorithms = advertised.Count > 0
             ? _allowedAlgorithms.Where(a => advertised.Contains(a)).ToArray()
             : _allowedAlgorithms.Where(a => !a.StartsWith("HS", StringComparison.Ordinal)).ToArray();
+        if (algorithms.Length == 0)
+        {
+            // An empty ValidAlgorithms list would make IdentityModel accept any algorithm.
+            throw new OidcProtocolException("The provider advertises no ID token signing algorithm this server accepts.");
+        }
 
         var keys = new List<SecurityKey>(config.SigningKeys);
 

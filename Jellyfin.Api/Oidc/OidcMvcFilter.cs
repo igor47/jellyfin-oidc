@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Jellyfin.Api.Controllers;
+using Jellyfin.Api.Models.UserDtos;
 using MediaBrowser.Model.Branding;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -35,16 +37,19 @@ public sealed class OidcMvcFilter : IAsyncActionFilter, IAsyncResultFilter
     };
 
     private readonly OidcOptions _options;
+    private readonly OidcUserService _userService;
     private readonly ILogger<OidcMvcFilter> _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="OidcMvcFilter"/> class.
     /// </summary>
     /// <param name="options">The options.</param>
+    /// <param name="userService">The OIDC user service.</param>
     /// <param name="logger">The logger.</param>
-    public OidcMvcFilter(OidcOptions options, ILogger<OidcMvcFilter> logger)
+    public OidcMvcFilter(OidcOptions options, OidcUserService userService, ILogger<OidcMvcFilter> logger)
     {
         _options = options;
+        _userService = userService;
         _logger = logger;
     }
 
@@ -78,7 +83,35 @@ public sealed class OidcMvcFilter : IAsyncActionFilter, IAsyncResultFilter
             return Task.CompletedTask;
         }
 
+        if (IsLoginForUserBeingCreated(context))
+        {
+            // Jellyfin creates users without a password; an OIDC-created user gets its random password a moment later.
+            _logger.LogWarning("Rejected password login from {IP} for a user that is being created by an OIDC login", context.HttpContext.Connection.RemoteIpAddress);
+            context.Result = new UnauthorizedResult();
+            return Task.CompletedTask;
+        }
+
         return next();
+    }
+
+    private bool IsLoginForUserBeingCreated(ActionExecutingContext context)
+    {
+        if (!_userService.IsAnyUserBeingCreated
+            || context.ActionDescriptor is not ControllerActionDescriptor descriptor
+            || descriptor.ControllerTypeInfo.AsType() != typeof(UserController))
+        {
+            return false;
+        }
+
+        if (string.Equals(descriptor.MethodInfo.Name, nameof(UserController.AuthenticateUserByName), StringComparison.Ordinal))
+        {
+            var request = context.ActionArguments.Values.OfType<AuthenticateUserByName>().FirstOrDefault();
+            return request is null || _userService.IsBeingCreated(request.Username);
+        }
+
+#pragma warning disable CS0618 // Type or member is obsolete: the legacy route identifies the user by id; refuse it during any creation.
+        return string.Equals(descriptor.MethodInfo.Name, nameof(UserController.AuthenticateUser), StringComparison.Ordinal);
+#pragma warning restore CS0618
     }
 
     /// <inheritdoc />
@@ -92,7 +125,7 @@ public sealed class OidcMvcFilter : IAsyncActionFilter, IAsyncResultFilter
                 && result.Value is BrandingOptionsDto dto)
             {
                 // The controller builds a fresh DTO per request; the stored branding is not touched.
-                dto.LoginDisclaimer = OidcBranding.AugmentDisclaimer(dto.LoginDisclaimer, _options, OidcUrls.LoginPath(_options, context.HttpContext.Request));
+                dto.LoginDisclaimer = OidcBranding.AugmentDisclaimer(dto.LoginDisclaimer, _options, OidcUrls.LoginPath(_options));
                 dto.CustomCss = OidcBranding.AugmentCss(dto.CustomCss, _options);
             }
             else if (string.Equals(descriptor.MethodInfo.Name, nameof(BrandingController.GetBrandingCss), StringComparison.Ordinal)

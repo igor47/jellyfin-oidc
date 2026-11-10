@@ -13,7 +13,6 @@ using MediaBrowser.Controller.Session;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
 
@@ -29,52 +28,43 @@ namespace Jellyfin.Api.Oidc;
 public class OidcController : ControllerBase
 {
     /// <summary>
-    /// The cookie binding a pending login to the browser that started it.
-    /// </summary>
-    public const string CookieName = "jellyfin_oidc";
-
-    /// <summary>
     /// The client name used for sessions created here; it is what the stock web client reports.
     /// </summary>
     public const string WebClientName = "Jellyfin Web";
 
     private readonly OidcOptions _options;
-    private readonly OidcStateStore _stateStore;
+    private readonly OidcLoginProtector _protector;
     private readonly OidcClient _client;
     private readonly OidcUserService _userService;
     private readonly ISessionManager _sessionManager;
     private readonly IServerApplicationHost _appHost;
-    private readonly IConfiguration _configuration;
     private readonly ILogger<OidcController> _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="OidcController"/> class.
     /// </summary>
     /// <param name="options">The options.</param>
-    /// <param name="stateStore">The pending login store.</param>
+    /// <param name="protector">The pending login cookie protector.</param>
     /// <param name="client">The OIDC client.</param>
     /// <param name="userService">The user service.</param>
     /// <param name="sessionManager">The session manager.</param>
     /// <param name="appHost">The application host.</param>
-    /// <param name="configuration">The application configuration.</param>
     /// <param name="logger">The logger.</param>
     public OidcController(
         OidcOptions options,
-        OidcStateStore stateStore,
+        OidcLoginProtector protector,
         OidcClient client,
         OidcUserService userService,
         ISessionManager sessionManager,
         IServerApplicationHost appHost,
-        IConfiguration configuration,
         ILogger<OidcController> logger)
     {
         _options = options;
-        _stateStore = stateStore;
+        _protector = protector;
         _client = client;
         _userService = userService;
         _sessionManager = sessionManager;
         _appHost = appHost;
-        _configuration = configuration;
         _logger = logger;
     }
 
@@ -101,11 +91,10 @@ public class OidcController : ControllerBase
             return ErrorPage(OidcLoginError.ProviderError);
         }
 
-        var baseUrl = BaseUrl();
-        var login = _stateStore.Create();
-        Response.Cookies.Append(CookieName, login.BrowserBinding, CookieOptions(baseUrl, OidcStateStore.Lifetime));
+        var login = _protector.Create();
+        Response.Cookies.Append(_protector.CookieName, _protector.Protect(login), _protector.CookieOptions(OidcLoginProtector.Lifetime));
         SetNoStore();
-        return Redirect(_client.BuildAuthorizationUrl(config, OidcUrls.CallbackUrl(baseUrl), login));
+        return Redirect(_client.BuildAuthorizationUrl(config, OidcUrls.CallbackUrl(_options), login));
     }
 
     /// <summary>
@@ -123,15 +112,14 @@ public class OidcController : ControllerBase
             return NotFound();
         }
 
-        var baseUrl = BaseUrl();
-        Request.Cookies.TryGetValue(CookieName, out var binding);
-        Response.Cookies.Delete(CookieName, CookieOptions(baseUrl, null));
+        // The cookie is cleared whatever happens, so a pending login can be completed at most once in this browser.
+        Request.Cookies.TryGetValue(_protector.CookieName, out var cookie);
+        Response.Cookies.Delete(_protector.CookieName, _protector.CookieOptions(null));
 
-        // Consume the state first, so it is single use whatever happens next.
-        var login = _stateStore.Take(state, binding);
+        var login = _protector.Unprotect(cookie, state);
         if (login is null)
         {
-            _logger.LogWarning("OIDC callback rejected: unknown, expired, reused or foreign state (IP: {IP})", HttpContext.GetNormalizedRemoteIP());
+            _logger.LogWarning("OIDC callback rejected: missing, expired, tampered or foreign login cookie, or state mismatch (IP: {IP})", HttpContext.GetNormalizedRemoteIP());
             return ErrorPage(OidcLoginError.InvalidState);
         }
 
@@ -150,7 +138,7 @@ public class OidcController : ControllerBase
         OidcIdentity identity;
         try
         {
-            identity = await _client.RedeemCodeAsync(code, OidcUrls.CallbackUrl(baseUrl), login, HttpContext.RequestAborted).ConfigureAwait(false);
+            identity = await _client.RedeemCodeAsync(code, OidcUrls.CallbackUrl(_options), login, HttpContext.RequestAborted).ConfigureAwait(false);
         }
         catch (OidcProtocolException ex)
         {
@@ -175,7 +163,7 @@ public class OidcController : ControllerBase
             return ErrorPage(result.Error);
         }
 
-        var deviceId = OidcStateStore.RandomToken();
+        var deviceId = OidcLoginProtector.RandomToken();
         AuthenticationResult session;
         try
         {
@@ -213,6 +201,7 @@ public class OidcController : ControllerBase
         OidcLoginError.InvalidUsername => "Your account has no usable username for this server.",
         OidcLoginError.UsernameTaken => "A different account with your username already exists on this server. Ask the administrator to link it.",
         OidcLoginError.NoAccount => "You do not have an account on this server. Ask the administrator to create one.",
+        OidcLoginError.LinkedUserMissing => "Your account on this server is not available. Ask the administrator.",
         OidcLoginError.AccountDisabled => "Your account on this server is disabled.",
         OidcLoginError.RemoteAccessDenied => "Your account may only be used from the local network.",
         OidcLoginError.ScheduleDenied => "Your account may not be used at this time.",
@@ -246,25 +235,6 @@ public class OidcController : ControllerBase
     {
         var code = new string(error.Where(c => c is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or '_').Take(64).ToArray());
         return code.Length == 0 ? "invalid" : code;
-    }
-
-    private string BaseUrl()
-        => OidcUrls.BaseUrl(_options, _configuration[MediaBrowser.Controller.Extensions.ConfigurationExtensions.AddressOverrideKey], Request);
-
-    private CookieOptions CookieOptions(string baseUrl, TimeSpan? maxAge)
-    {
-        var uri = new Uri(baseUrl);
-        return new CookieOptions
-        {
-            HttpOnly = true,
-
-            // Lax: the cookie must come along on the top-level GET redirect back from the provider.
-            SameSite = SameSiteMode.Lax,
-            Secure = uri.Scheme == Uri.UriSchemeHttps,
-            Path = uri.AbsolutePath.TrimEnd('/') + "/oidc",
-            MaxAge = maxAge,
-            IsEssential = true
-        };
     }
 
     private void SetNoStore()
@@ -317,9 +287,9 @@ public class OidcController : ControllerBase
             _ => StatusCodes.Status403Forbidden
         };
 
-        var webUrl = WebUtility.HtmlEncode(new Uri(BaseUrl()).AbsolutePath.TrimEnd('/') + "/web/");
+        var webUrl = WebUtility.HtmlEncode(OidcUrls.WebPath(_options));
         var body = "<h1>Sign-in failed</h1><p>" + WebUtility.HtmlEncode(ErrorMessage(error)) + "</p><p><a href=\"" + webUrl + "\">Back to Jellyfin</a></p>";
-        return Page(status, "Sign-in failed", body, null, OidcStateStore.RandomToken());
+        return Page(status, "Sign-in failed", body, null, OidcLoginProtector.RandomToken());
     }
 
     private ContentResult HandoffPage(AuthenticationResult session, string deviceId)
@@ -350,6 +320,6 @@ public class OidcController : ControllerBase
             + "location.replace(addr+'/web/');})();";
 
         var body = "<p>Signing you in&hellip;</p><noscript><p>JavaScript is required to finish signing in.</p></noscript>";
-        return Page(StatusCodes.Status200OK, "Signing in", body, script, OidcStateStore.RandomToken());
+        return Page(StatusCodes.Status200OK, "Signing in", body, script, OidcLoginProtector.RandomToken());
     }
 }

@@ -58,9 +58,10 @@ public sealed class OidcHostedService : IHostedService
                 _options.ClientId,
                 _options.AutoCreateUsers,
                 _options.LinkExistingByUsername);
-            if (_options.RedirectBaseUrl is null)
+            _logger.LogInformation("OIDC redirect URI: {RedirectUri}", OidcUrls.CallbackUrl(_options));
+            if (_options.AllowAnyUser && _options.AutoCreateUsers && _options.AllowedGroups.Count == 0)
             {
-                _logger.LogWarning("JELLYFIN_OIDC_REDIRECT_BASE_URL is not set; the redirect URI is derived from the published server URL or each request");
+                _logger.LogWarning("JELLYFIN_OIDC_ALLOW_ANY_USER is set: anyone the identity provider authenticates gets a Jellyfin account");
             }
 
             if (_options.Issuer.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
