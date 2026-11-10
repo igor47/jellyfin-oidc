@@ -71,6 +71,7 @@ namespace Jellyfin.Server
             });
 
             services.AddJellyfinApi(_serverApplicationHost.GetApiPluginAssemblies(), _serverConfigurationManager.GetNetworkConfiguration());
+            Jellyfin.Api.Oidc.OidcServiceCollectionExtensions.AddJellyfinOidc(services);
             services.AddJellyfinDbContext(_serverApplicationHost.ConfigurationManager, _configuration);
             services.AddJellyfinApiSwagger();
 
