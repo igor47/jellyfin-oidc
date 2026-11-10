@@ -123,6 +123,37 @@ public sealed class OidcClientTests : IDisposable
     }
 
     [Fact]
+    public void ShortClientSecret_IsNeverAnHmacKey()
+    {
+        var factory = new Mock<IHttpClientFactory>();
+        var shortSecret = new OidcClient(
+            new OidcOptions { Enabled = true, Issuer = Issuer, ClientId = ClientId, ClientSecret = "short-secret" },
+            factory.Object,
+            NullLogger<OidcClient>.Instance);
+        _config.IdTokenSigningAlgValuesSupported.Add(SecurityAlgorithms.HmacSha256);
+
+        var parameters = shortSecret.CreateValidationParameters(_config);
+
+        Assert.DoesNotContain(parameters.IssuerSigningKeys, k => k is SymmetricSecurityKey);
+        Assert.Contains(parameters.IssuerSigningKeys, k => k is RsaSecurityKey);
+    }
+
+    [Fact]
+    public async Task NoCommonAlgorithm_IsRejected()
+    {
+        // An empty ValidAlgorithms list would make IdentityModel accept any algorithm.
+        _config.IdTokenSigningAlgValuesSupported.Clear();
+        _config.IdTokenSigningAlgValuesSupported.Add("EdDSA");
+
+        Assert.Throws<OidcProtocolException>(() => _client.CreateValidationParameters(_config));
+        await Assert.ThrowsAsync<OidcProtocolException>(() => _client.ValidateIdTokenAsync(_config, ValidToken(), Nonce, CancellationToken.None));
+    }
+
+    [Fact]
+    public void ValidAlgorithms_AreTheAdvertisedOnes()
+        => Assert.Equal(new[] { SecurityAlgorithms.RsaSha256 }, _client.CreateValidationParameters(_config).ValidAlgorithms);
+
+    [Fact]
     public async Task RsaToken_RejectedWhenOnlyHmacAdvertised()
     {
         _config.IdTokenSigningAlgValuesSupported.Clear();
@@ -212,8 +243,8 @@ public sealed class OidcClientTests : IDisposable
     [Fact]
     public void AuthorizationUrl_HasPkceStateNonce()
     {
-        var store = new OidcStateStore(TimeProvider.System);
-        var login = store.Create();
+        using var protector = new OidcLoginProtector(new OidcOptions { ExternalBaseUrl = "https://jf.example.org" }, TimeProvider.System);
+        var login = protector.Create();
         var url = new Uri(_client.BuildAuthorizationUrl(_config, "https://jf.example.org/oidc/callback", login));
         var query = QueryHelpers.ParseQuery(url.Query);
 
@@ -225,10 +256,9 @@ public sealed class OidcClientTests : IDisposable
         Assert.Equal("openid profile", query["scope"]);
         Assert.Equal(login.State, query["state"]);
         Assert.Equal(login.Nonce, query["nonce"]);
-        Assert.Equal(OidcStateStore.CodeChallenge(login.CodeVerifier), query["code_challenge"]);
+        Assert.Equal(OidcLoginProtector.CodeChallenge(login.CodeVerifier), query["code_challenge"]);
         Assert.Equal("S256", query["code_challenge_method"]);
         Assert.DoesNotContain(login.CodeVerifier, url.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain(login.BrowserBinding, url.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]

@@ -4,7 +4,6 @@ using Jellyfin.Api.Oidc;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Server.Implementations.Users;
 using MediaBrowser.Controller.Authentication;
-using MediaBrowser.Model.Cryptography;
 using Xunit;
 
 namespace Jellyfin.Api.Tests.Oidc;
@@ -41,24 +40,13 @@ public class OidcAuthenticationProviderTests
     }
 
     [Fact]
-    public async Task ChangePassword_Empty_KeepsUserOidcOnly()
+    public async Task ChangePassword_Empty_KeepsUserOidcOnlyWithRandomPassword()
     {
         var user = OidcUser();
         await _provider.ChangePassword(user, string.Empty);
         Assert.Equal(OidcAuthenticationProvider.ProviderId, user.AuthenticationProviderId);
-        Assert.Null(user.Password);
-    }
 
-    private sealed class FakeCrypto : ICryptoProvider
-    {
-        public string DefaultHashMethod => "PBKDF2-SHA512";
-
-        public PasswordHash CreatePasswordHash(ReadOnlySpan<char> password) => new(DefaultHashMethod, new byte[] { 1, 2, 3 });
-
-        public bool Verify(PasswordHash hash, ReadOnlySpan<char> password) => false;
-
-        public byte[] GenerateSalt() => new byte[] { 4 };
-
-        public byte[] GenerateSalt(int length) => new byte[length];
+        // Never null: an empty password would let anyone in if the provider ever became the default one.
+        Assert.False(string.IsNullOrEmpty(user.Password));
     }
 }

@@ -13,11 +13,13 @@ public class OidcOptionsTests
         ["JELLYFIN_OIDC_ENABLED"] = "true",
         ["JELLYFIN_OIDC_ISSUER"] = "https://auth.example.org/application/o/jellyfin/",
         ["JELLYFIN_OIDC_CLIENT_ID"] = "jellyfin",
-        ["JELLYFIN_OIDC_CLIENT_SECRET"] = "s3cret"
+        ["JELLYFIN_OIDC_CLIENT_SECRET"] = "s3cret",
+        ["JELLYFIN_OIDC_REDIRECT_BASE_URL"] = "https://media.example.org",
+        ["JELLYFIN_OIDC_ALLOW_ANY_USER"] = "true"
     };
 
-    private static OidcOptions Parse(Dictionary<string, string?> env, Func<string, string>? readFile = null)
-        => OidcOptions.Parse(name => env.GetValueOrDefault(name), readFile ?? (_ => throw new FileNotFoundException()));
+    private static OidcOptions Parse(Dictionary<string, string?> env, Func<string, string>? readFile = null, string? publishedServerUrl = null)
+        => OidcOptions.Parse(name => env.GetValueOrDefault(name), readFile ?? (_ => throw new FileNotFoundException()), publishedServerUrl);
 
     [Fact]
     public void Parse_Empty_IsDisabledWithDefaults()
@@ -57,7 +59,8 @@ public class OidcOptionsTests
         Assert.False(options.LinkExistingByUsername);
         Assert.Equal("SSO", options.ProviderName);
         Assert.False(options.DisablePasswordLogin);
-        Assert.Null(options.RedirectBaseUrl);
+        Assert.True(options.AllowAnyUser);
+        Assert.Equal("https://media.example.org", options.ExternalBaseUrl);
     }
 
     [Fact]
@@ -85,7 +88,7 @@ public class OidcOptionsTests
         Assert.True(options.LinkExistingByUsername);
         Assert.Equal("Authentik", options.ProviderName);
         Assert.True(options.DisablePasswordLogin);
-        Assert.Equal("https://media.example.org/jf", options.RedirectBaseUrl);
+        Assert.Equal("https://media.example.org/jf", options.ExternalBaseUrl);
     }
 
     [Theory]
@@ -161,4 +164,66 @@ public class OidcOptionsTests
     [InlineData("JELLYFIN_CONFIG_DIR", "value")]
     public void RedactForLog(string name, string expected)
         => Assert.Equal(expected, OidcOptions.RedactForLog(name, "value"));
+
+    [Fact]
+    public void Parse_NoBaseUrl_Throws()
+    {
+        var env = ValidEnv();
+        env.Remove("JELLYFIN_OIDC_REDIRECT_BASE_URL");
+        var ex = Assert.Throws<OidcConfigurationException>(() => Parse(env));
+        Assert.Contains("REDIRECT_BASE_URL", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Parse_PublishedServerUrl_IsUsedAsBase()
+    {
+        var env = ValidEnv();
+        env.Remove("JELLYFIN_OIDC_REDIRECT_BASE_URL");
+        Assert.Equal("https://jf.example.org/base", Parse(env, publishedServerUrl: "https://jf.example.org/base/").ExternalBaseUrl);
+    }
+
+    [Fact]
+    public void Parse_RedirectBaseUrl_WinsOverPublishedServerUrl()
+        => Assert.Equal("https://media.example.org", Parse(ValidEnv(), publishedServerUrl: "http://192.168.1.2:8096").ExternalBaseUrl);
+
+    [Theory]
+    [InlineData("192.168.1.2:8096")]
+    [InlineData("/jellyfin")]
+    [InlineData("ftp://x.example.org")]
+    public void Parse_InvalidPublishedServerUrl_Throws(string published)
+    {
+        var env = ValidEnv();
+        env.Remove("JELLYFIN_OIDC_REDIRECT_BASE_URL");
+        Assert.Throws<OidcConfigurationException>(() => Parse(env, publishedServerUrl: published));
+    }
+
+    [Fact]
+    public void Parse_Disabled_DoesNotNeedBaseUrl()
+        => Assert.False(Parse(new() { ["JELLYFIN_OIDC_DISABLE_PASSWORD_LOGIN"] = "true" }).Enabled);
+
+    [Fact]
+    public void Parse_AutoCreateForEveryone_RequiresExplicitChoice()
+    {
+        var env = ValidEnv();
+        env.Remove("JELLYFIN_OIDC_ALLOW_ANY_USER");
+        var ex = Assert.Throws<OidcConfigurationException>(() => Parse(env));
+        Assert.Contains("ALLOWED_GROUPS", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("AUTO_CREATE_USERS", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("ALLOW_ANY_USER", ex.Message, StringComparison.Ordinal);
+
+        env["JELLYFIN_OIDC_ALLOW_ANY_USER"] = "false";
+        Assert.Throws<OidcConfigurationException>(() => Parse(env));
+    }
+
+    [Theory]
+    [InlineData("JELLYFIN_OIDC_ALLOWED_GROUPS", "media")]
+    [InlineData("JELLYFIN_OIDC_AUTO_CREATE_USERS", "false")]
+    [InlineData("JELLYFIN_OIDC_ALLOW_ANY_USER", "true")]
+    public void Parse_AutoCreateForEveryone_AnyChoiceIsAccepted(string name, string value)
+    {
+        var env = ValidEnv();
+        env.Remove("JELLYFIN_OIDC_ALLOW_ANY_USER");
+        env[name] = value;
+        Assert.True(Parse(env).Enabled);
+    }
 }
