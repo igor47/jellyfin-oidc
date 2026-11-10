@@ -46,7 +46,7 @@ public static class StartupHelpers
         {
             if (_relevantEnvVarPrefixes.Any(prefix => key.ToString()!.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
             {
-                relevantEnvVars.Add(key, allEnvVars[key]!);
+                relevantEnvVars.Add(key, Jellyfin.Api.Oidc.OidcOptions.RedactForLog(key.ToString()!, allEnvVars[key]!));
             }
         }
 
