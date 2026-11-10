@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Concurrent;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -8,6 +10,8 @@ using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Enums;
 using MediaBrowser.Common.Net;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.Session;
+using MediaBrowser.Model.Cryptography;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Api.Oidc;
@@ -26,9 +30,12 @@ public sealed partial class OidcUserService : IDisposable
     private readonly OidcOptions _options;
     private readonly OidcLinkStore _links;
     private readonly IUserManager _userManager;
+    private readonly ISessionManager _sessionManager;
+    private readonly ICryptoProvider _cryptoProvider;
     private readonly INetworkManager _networkManager;
     private readonly ILogger<OidcUserService> _logger;
     private readonly SemaphoreSlim _resolveLock = new(1, 1);
+    private readonly ConcurrentDictionary<string, byte> _creating = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Initializes a new instance of the <see cref="OidcUserService"/> class.
@@ -36,21 +43,32 @@ public sealed partial class OidcUserService : IDisposable
     /// <param name="options">The options.</param>
     /// <param name="links">The link store.</param>
     /// <param name="userManager">The user manager.</param>
+    /// <param name="sessionManager">The session manager.</param>
+    /// <param name="cryptoProvider">The crypto provider.</param>
     /// <param name="networkManager">The network manager.</param>
     /// <param name="logger">The logger.</param>
     public OidcUserService(
         OidcOptions options,
         OidcLinkStore links,
         IUserManager userManager,
+        ISessionManager sessionManager,
+        ICryptoProvider cryptoProvider,
         INetworkManager networkManager,
         ILogger<OidcUserService> logger)
     {
         _options = options;
         _links = links;
         _userManager = userManager;
+        _sessionManager = sessionManager;
+        _cryptoProvider = cryptoProvider;
         _networkManager = networkManager;
         _logger = logger;
     }
+
+    /// <summary>
+    /// Gets a value indicating whether a user is being created right now.
+    /// </summary>
+    public bool IsAnyUserBeingCreated => !_creating.IsEmpty;
 
     /// <summary>
     /// Turns a claim value into a valid Jellyfin username. Characters Jellyfin does not allow in
@@ -78,6 +96,23 @@ public sealed partial class OidcUserService : IDisposable
     }
 
     /// <summary>
+    /// Returns a random password with 256 bits of entropy. Nobody ever learns it; it only makes sure an account
+    /// never has an empty password, whatever authentication provider it ends up with.
+    /// </summary>
+    /// <returns>The password.</returns>
+    public static string RandomPassword() => Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+
+    /// <summary>
+    /// Returns whether a user with this name is being created by an OIDC login right now. Jellyfin's
+    /// <c>UserManager.CreateUserAsync</c> creates users without a password, so password login must be refused for
+    /// that name until the random password is set.
+    /// </summary>
+    /// <param name="username">The username.</param>
+    /// <returns><c>true</c> if it is.</returns>
+    public bool IsBeingCreated(string? username)
+        => !string.IsNullOrWhiteSpace(username) && _creating.ContainsKey(NormalizeName(username));
+
+    /// <summary>
     /// Returns whether the identity may log in at all.
     /// </summary>
     /// <param name="identity">The identity.</param>
@@ -101,23 +136,24 @@ public sealed partial class OidcUserService : IDisposable
     /// <returns>The result.</returns>
     public async Task<OidcUserResult> ResolveAsync(OidcIdentity identity, string remoteEndPoint)
     {
-        if (!IsAllowed(identity))
-        {
-            _logger.LogWarning("OIDC login denied for subject {Subject}: not in an allowed group", identity.Subject);
-            return OidcUserResult.Fail(OidcLoginError.NotInAllowedGroup);
-        }
-
-        User? user;
+        User user;
         await _resolveLock.WaitAsync().ConfigureAwait(false);
         try
         {
+            if (!IsAllowed(identity))
+            {
+                _logger.LogWarning("OIDC login denied for subject {Subject}: not in an allowed group", identity.Subject);
+                await RevokeLinkedUserAsync(identity).ConfigureAwait(false);
+                return OidcUserResult.Fail(OidcLoginError.NotInAllowedGroup);
+            }
+
             var result = await FindOrCreateAsync(identity).ConfigureAwait(false);
             if (result.User is null)
             {
                 return result;
             }
 
-            user = await SyncAdminAsync(result.User, identity).ConfigureAwait(false);
+            user = await SyncAdminAsync(result.User.Id, identity).ConfigureAwait(false);
         }
         finally
         {
@@ -127,7 +163,8 @@ public sealed partial class OidcUserService : IDisposable
         // The same account checks UserManager.AuthenticateUser applies to password logins.
         if (user.HasPermission(PermissionKind.IsDisabled))
         {
-            _logger.LogWarning("OIDC login denied for {UserName}: account disabled", user.Username);
+            _logger.LogWarning("OIDC login denied for {UserName}: account disabled; revoking its sessions", user.Username);
+            await _sessionManager.RevokeUserTokens(user.Id, null!).ConfigureAwait(false);
             return OidcUserResult.Fail(OidcLoginError.AccountDisabled);
         }
 
@@ -143,14 +180,26 @@ public sealed partial class OidcUserService : IDisposable
             return OidcUserResult.Fail(OidcLoginError.ScheduleDenied);
         }
 
-        // ISessionManager.AuthenticateDirect does not record the login; password logins do.
-        user.LastLoginDate = DateTime.UtcNow;
-        await _userManager.UpdateUserAsync(user).ConfigureAwait(false);
-        return OidcUserResult.Success(_userManager.GetUserById(user.Id) ?? user);
+        return OidcUserResult.Success(user);
     }
 
     /// <inheritdoc />
     public void Dispose() => _resolveLock.Dispose();
+
+    // The same normalisation Jellyfin uses for username uniqueness and lookup (User.NormalizedUsername,
+    // UserManager.GetUserByName/CreateUserAsync): ToUpperInvariant. Matching with it can never find a user
+    // Jellyfin itself would consider a different name.
+    private static string NormalizeName(string username) => username.ToUpperInvariant();
+
+    private async Task RevokeLinkedUserAsync(OidcIdentity identity)
+    {
+        if (await _links.FindUserAsync(identity.Issuer, identity.Subject).ConfigureAwait(false) is Guid id
+            && _userManager.GetUserById(id) is not null)
+        {
+            _logger.LogWarning("Revoking all sessions of user {UserId}: its identity is no longer allowed to sign in", id);
+            await _sessionManager.RevokeUserTokens(id, null!).ConfigureAwait(false);
+        }
+    }
 
     private async Task<OidcUserResult> FindOrCreateAsync(OidcIdentity identity)
     {
@@ -163,9 +212,15 @@ public sealed partial class OidcUserService : IDisposable
                 return OidcUserResult.Success(linked);
             }
 
-            // The Jellyfin user was deleted: forget the link and treat this as a first login.
-            _logger.LogInformation("OIDC link for subject {Subject} points to deleted user {UserId}; removing it", identity.Subject, id);
-            await _links.UnlinkAsync(identity.Issuer, identity.Subject).ConfigureAwait(false);
+            // Never silently re-create: the operator deleted this account, possibly on purpose.
+            _logger.LogError(
+                "OIDC login refused for subject {Subject} (issuer {Issuer}): it is linked to Jellyfin user {UserId}, which no longer exists. "
+                + "Remove that entry from {LinkFile} to allow the account to be re-created",
+                identity.Subject,
+                identity.Issuer,
+                id,
+                _links.FilePath);
+            return OidcUserResult.Fail(OidcLoginError.LinkedUserMissing);
         }
 
         var username = SanitizeUsername(identity.Username);
@@ -178,6 +233,7 @@ public sealed partial class OidcUserService : IDisposable
             return OidcUserResult.Fail(OidcLoginError.InvalidUsername);
         }
 
+        // GetUserByName compares NormalizedUsername with ToUpperInvariant, Jellyfin's own uniqueness rule.
         var existing = _userManager.GetUserByName(username);
         if (existing is not null)
         {
@@ -199,11 +255,17 @@ public sealed partial class OidcUserService : IDisposable
                 return OidcUserResult.Fail(OidcLoginError.UsernameTaken);
             }
 
-            // Switch the provider before persisting the link, so a failure can never leave a linked user with password login.
-            existing = await AssignOidcProviderAsync(existing).ConfigureAwait(false);
-            await _links.LinkAsync(identity.Issuer, identity.Subject, existing.Id).ConfigureAwait(false);
-            _logger.LogInformation("OIDC subject {Subject} linked to existing user {UserName}", identity.Subject, existing.Username);
-            return OidcUserResult.Success(existing);
+            // Adoption: whoever held this account before (possibly someone who renamed their account to squat the
+            // name) must keep nothing. Lock it to OIDC with a new random password, then revoke every existing token,
+            // all before the link is persisted and before any administrator status is granted.
+            var adopted = await LockToOidcAsync(existing.Id).ConfigureAwait(false);
+            await _sessionManager.RevokeUserTokens(adopted.Id, null!).ConfigureAwait(false);
+            await _links.LinkAsync(identity.Issuer, identity.Subject, adopted.Id).ConfigureAwait(false);
+            _logger.LogInformation(
+                "OIDC subject {Subject} linked to existing user {UserName}; its password was replaced and its sessions revoked",
+                identity.Subject,
+                adopted.Username);
+            return OidcUserResult.Success(adopted);
         }
 
         if (!_options.AutoCreateUsers)
@@ -212,65 +274,73 @@ public sealed partial class OidcUserService : IDisposable
             return OidcUserResult.Fail(OidcLoginError.NoAccount);
         }
 
-        // Default policy, same as a user created in the dashboard (all libraries, hidden from the login screen).
-        var created = await _userManager.CreateUserAsync(username).ConfigureAwait(false);
+        var key = NormalizeName(username);
+        _creating[key] = 0;
         try
         {
-            // A new user has no password; switch it to the OIDC provider right away so it never accepts an empty one.
-            created = await AssignOidcProviderAsync(created).ConfigureAwait(false);
-            await _links.LinkAsync(identity.Issuer, identity.Subject, created.Id).ConfigureAwait(false);
-        }
-        catch
-        {
-            await _userManager.DeleteUserAsync(created.Id).ConfigureAwait(false);
-            throw;
-        }
+            // Default policy, same as a user created in the dashboard (all libraries, hidden from the login screen).
+            var created = await _userManager.CreateUserAsync(username).ConfigureAwait(false);
+            try
+            {
+                // CreateUserAsync leaves the password empty: set a random one right away through the upstream path
+                // (the new user still has the default provider), then switch to the OIDC provider.
+                await _userManager.ChangePassword(created.Id, RandomPassword()).ConfigureAwait(false);
+                created = await LockToOidcAsync(created.Id).ConfigureAwait(false);
+                await _links.LinkAsync(identity.Issuer, identity.Subject, created.Id).ConfigureAwait(false);
+            }
+            catch
+            {
+                try
+                {
+                    await _userManager.DeleteUserAsync(created.Id).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Could not remove partially created user {UserName}", username);
+                }
 
-        _logger.LogInformation("OIDC subject {Subject} created user {UserName}", identity.Subject, created.Username);
-        return OidcUserResult.Success(created);
+                throw;
+            }
+
+            _logger.LogInformation("OIDC subject {Subject} created user {UserName}", identity.Subject, created.Username);
+            return OidcUserResult.Success(created);
+        }
+        finally
+        {
+            _creating.TryRemove(key, out _);
+        }
     }
 
-    // Only done when linking: if an administrator later sets a password, the user moves back to the
-    // default provider (see OidcAuthenticationProvider.ChangePassword) and that must stick.
-    private async Task<User> AssignOidcProviderAsync(User user)
+    // Sets a random password hash and the OIDC provider in one update, on a freshly loaded copy of the user.
+    private async Task<User> LockToOidcAsync(Guid userId)
     {
-        if (string.Equals(user.AuthenticationProviderId, OidcAuthenticationProvider.ProviderId, StringComparison.Ordinal))
+        var user = _userManager.GetUserById(userId) ?? throw new InvalidOperationException("User disappeared while linking.");
+        user.Password = _cryptoProvider.CreatePasswordHash(RandomPassword()).ToString();
+        user.AuthenticationProviderId = OidcAuthenticationProvider.ProviderId;
+        await _userManager.UpdateUserAsync(user).ConfigureAwait(false);
+        return _userManager.GetUserById(userId) ?? user;
+    }
+
+    private async Task<User> SyncAdminAsync(Guid userId, OidcIdentity identity)
+    {
+        // Load right before writing, so the write cannot revert a concurrent change made in the dashboard.
+        var user = _userManager.GetUserById(userId) ?? throw new InvalidOperationException("User disappeared while signing in.");
+        var shouldBeAdmin = ShouldBeAdmin(identity);
+        if (shouldBeAdmin is not bool admin || admin == user.HasPermission(PermissionKind.IsAdministrator))
         {
             return user;
         }
 
-        user.AuthenticationProviderId = OidcAuthenticationProvider.ProviderId;
+        if (!admin && _userManager.GetUsers().Count(u => u.HasPermission(PermissionKind.IsAdministrator)) <= 1)
+        {
+            _logger.LogWarning("Not removing administrator status from {UserName}: it is the only administrator", user.Username);
+            return user;
+        }
+
+        user.SetPermission(PermissionKind.IsAdministrator, admin);
         await _userManager.UpdateUserAsync(user).ConfigureAwait(false);
-        return _userManager.GetUserById(user.Id) ?? user;
-    }
-
-    private async Task<User> SyncAdminAsync(User user, OidcIdentity identity)
-    {
-        var changed = false;
-        var shouldBeAdmin = ShouldBeAdmin(identity);
-        if (shouldBeAdmin is bool admin && admin != user.HasPermission(PermissionKind.IsAdministrator))
-        {
-            if (!admin && _userManager.GetUsers().Count(u => u.HasPermission(PermissionKind.IsAdministrator)) <= 1)
-            {
-                _logger.LogWarning(
-                    "Not removing administrator status from {UserName}: it is the only administrator",
-                    user.Username);
-            }
-            else
-            {
-                user.SetPermission(PermissionKind.IsAdministrator, admin);
-                changed = true;
-                _logger.LogInformation("OIDC set administrator status of {UserName} to {IsAdmin}", user.Username, admin);
-            }
-        }
-
-        if (changed)
-        {
-            await _userManager.UpdateUserAsync(user).ConfigureAwait(false);
-            user = _userManager.GetUserById(user.Id) ?? user;
-        }
-
-        return user;
+        _logger.LogInformation("OIDC set administrator status of {UserName} to {IsAdmin}", user.Username, admin);
+        return _userManager.GetUserById(userId) ?? user;
     }
 
     [GeneratedRegex(@"[^\w\ \-'._@+]")]

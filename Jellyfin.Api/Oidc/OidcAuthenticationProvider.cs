@@ -52,11 +52,11 @@ public class OidcAuthenticationProvider : IAuthenticationProvider, IRequiresReso
     /// <inheritdoc />
     public Task ChangePassword(User user, string newPassword)
     {
-        // An empty password would make the account password-less (anyone could log in by name),
-        // so a "reset" keeps the account OIDC-only.
+        // An empty password would make the account password-less (anyone could log in by name if the provider
+        // ever went back to the default one), so a "reset" stores a random password and keeps the account OIDC-only.
         if (string.IsNullOrEmpty(newPassword))
         {
-            user.Password = null;
+            user.Password = _cryptoProvider.CreatePasswordHash(OidcUserService.RandomPassword()).ToString();
             return Task.CompletedTask;
         }
 

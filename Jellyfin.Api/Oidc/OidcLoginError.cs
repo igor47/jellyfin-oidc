@@ -23,6 +23,9 @@ public enum OidcLoginError
     /// <summary>No linked user and automatic creation is disabled.</summary>
     NoAccount,
 
+    /// <summary>The identity is linked to a Jellyfin user that no longer exists.</summary>
+    LinkedUserMissing,
+
     /// <summary>The Jellyfin account is disabled.</summary>
     AccountDisabled,
 

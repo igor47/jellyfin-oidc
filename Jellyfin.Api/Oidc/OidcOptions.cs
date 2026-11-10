@@ -82,24 +82,34 @@ public sealed class OidcOptions
     public bool DisablePasswordLogin { get; init; }
 
     /// <summary>
-    /// Gets the external base URL (no trailing slash), or <c>null</c> to derive it per request.
+    /// Gets a value indicating whether anyone the provider authenticates may get an account
+    /// (required when users are created automatically and no allowed groups are set).
     /// </summary>
-    public string? RedirectBaseUrl { get; init; }
+    public bool AllowAnyUser { get; init; }
+
+    /// <summary>
+    /// Gets the external base URL (no trailing slash) used for the redirect URI, the cookie and the login button:
+    /// <c>JELLYFIN_OIDC_REDIRECT_BASE_URL</c>, else Jellyfin's published server URL. It is never derived from a request.
+    /// </summary>
+    public string ExternalBaseUrl { get; init; } = string.Empty;
 
     /// <summary>
     /// Reads and validates the options from the process environment.
     /// </summary>
+    /// <param name="publishedServerUrl">Jellyfin's published server URL setting, if any.</param>
     /// <returns>The options.</returns>
-    public static OidcOptions FromEnvironment() => Parse(Environment.GetEnvironmentVariable, File.ReadAllText);
+    public static OidcOptions FromEnvironment(string? publishedServerUrl)
+        => Parse(Environment.GetEnvironmentVariable, File.ReadAllText, publishedServerUrl);
 
     /// <summary>
     /// Reads and validates the options.
     /// </summary>
     /// <param name="getVariable">Returns the value of an environment variable, or <c>null</c>.</param>
     /// <param name="readFile">Reads a whole file (used for <c>CLIENT_SECRET_FILE</c>).</param>
+    /// <param name="publishedServerUrl">Jellyfin's published server URL setting, if any.</param>
     /// <returns>The options.</returns>
     /// <exception cref="OidcConfigurationException">The configuration is invalid.</exception>
-    public static OidcOptions Parse(Func<string, string?> getVariable, Func<string, string> readFile)
+    public static OidcOptions Parse(Func<string, string?> getVariable, Func<string, string> readFile, string? publishedServerUrl)
     {
         ArgumentNullException.ThrowIfNull(getVariable);
         ArgumentNullException.ThrowIfNull(readFile);
@@ -179,19 +189,41 @@ public sealed class OidcOptions
             throw new OidcConfigurationException(Prefix + "SCOPES must include 'openid'.");
         }
 
-        string? redirectBase = Get("REDIRECT_BASE_URL");
-        if (redirectBase is not null)
+        // The redirect URI, cookie and button must never come from the request's Host header.
+        var redirectBase = Get("REDIRECT_BASE_URL");
+        var baseSource = Prefix + "REDIRECT_BASE_URL";
+        if (redirectBase is null && !string.IsNullOrWhiteSpace(publishedServerUrl))
         {
-            if (!Uri.TryCreate(redirectBase, UriKind.Absolute, out var redirectUri)
-                || (redirectUri.Scheme != Uri.UriSchemeHttps && redirectUri.Scheme != Uri.UriSchemeHttp)
-                || !string.IsNullOrEmpty(redirectUri.Query)
-                || !string.IsNullOrEmpty(redirectUri.Fragment)
-                || !string.IsNullOrEmpty(redirectUri.UserInfo))
-            {
-                throw new OidcConfigurationException(Prefix + "REDIRECT_BASE_URL must be an absolute http(s) URL without query, fragment or credentials.");
-            }
+            redirectBase = publishedServerUrl.Trim();
+            baseSource = "the published server URL (JELLYFIN_PublishedServerUrl / --published-server-url)";
+        }
 
-            redirectBase = redirectBase.TrimEnd('/');
+        if (redirectBase is null)
+        {
+            throw new OidcConfigurationException(
+                Prefix + "REDIRECT_BASE_URL is required when " + Prefix + "ENABLED is true (or set Jellyfin's published server URL): "
+                + "the external URL users reach Jellyfin at, e.g. https://jellyfin.example.org. It is never derived from request headers.");
+        }
+
+        if (!Uri.TryCreate(redirectBase, UriKind.Absolute, out var redirectUri)
+            || (redirectUri.Scheme != Uri.UriSchemeHttps && redirectUri.Scheme != Uri.UriSchemeHttp)
+            || !string.IsNullOrEmpty(redirectUri.Query)
+            || !string.IsNullOrEmpty(redirectUri.Fragment)
+            || !string.IsNullOrEmpty(redirectUri.UserInfo))
+        {
+            throw new OidcConfigurationException(baseSource + " must be an absolute http(s) URL without query, fragment or credentials.");
+        }
+
+        var allowedGroups = ParseList(Get("ALLOWED_GROUPS"));
+        var autoCreate = GetBool("AUTO_CREATE_USERS", true);
+        var allowAnyUser = GetBool("ALLOW_ANY_USER", false);
+        if (autoCreate && allowedGroups.Length == 0 && !allowAnyUser)
+        {
+            throw new OidcConfigurationException(
+                "With " + Prefix + "AUTO_CREATE_USERS on and no " + Prefix + "ALLOWED_GROUPS, anyone your identity provider "
+                + "authenticates would get a Jellyfin account. Choose one: restrict sign-in with " + Prefix + "ALLOWED_GROUPS, "
+                + "turn off " + Prefix + "AUTO_CREATE_USERS (accounts must then exist or be linked), or set "
+                + Prefix + "ALLOW_ANY_USER=true to allow it explicitly.");
         }
 
         return new OidcOptions
@@ -203,13 +235,14 @@ public sealed class OidcOptions
             Scopes = scopes,
             UsernameClaim = Get("USERNAME_CLAIM") ?? "preferred_username",
             GroupsClaim = Get("GROUPS_CLAIM") ?? "groups",
-            AllowedGroups = ParseList(Get("ALLOWED_GROUPS")),
+            AllowedGroups = allowedGroups,
             AdminGroups = ParseList(Get("ADMIN_GROUPS")),
-            AutoCreateUsers = GetBool("AUTO_CREATE_USERS", true),
+            AutoCreateUsers = autoCreate,
+            AllowAnyUser = allowAnyUser,
             LinkExistingByUsername = GetBool("LINK_EXISTING_BY_USERNAME", false),
             ProviderName = Get("PROVIDER_NAME") ?? "SSO",
             DisablePasswordLogin = disablePasswordLogin,
-            RedirectBaseUrl = redirectBase
+            ExternalBaseUrl = redirectBase.TrimEnd('/')
         };
     }
 

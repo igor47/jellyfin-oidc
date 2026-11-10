@@ -161,6 +161,7 @@ public sealed class OidcLinkStore : IDisposable
 
     private void Save(List<OidcLink> links)
     {
+        Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
         var tmp = _path + ".tmp";
         File.WriteAllText(tmp, JsonSerializer.Serialize(new LinkFile { Version = 1, Links = links }, _jsonOptions));
         File.Move(tmp, _path, true);
