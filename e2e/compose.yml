@@ -1,0 +1,82 @@
+# End-to-end test stack. Driven by e2e/run.sh; not meant to be run by hand.
+#
+# Networking: `netns` owns a network namespace that jellyfin and the
+# Playwright runner both join. The browser therefore reaches Jellyfin as
+# http://localhost:8096, which Chromium treats as a secure context (so Secure
+# cookies and the like behave as they would behind an HTTPS reverse proxy),
+# and the IdP as https://idp:8443, the same URL the server uses for discovery
+# and the token exchange. jellyfin can be recreated with different settings
+# between phases without disturbing the namespace.
+
+name: ${E2E_PROJECT:?}
+
+services:
+  netns:
+    image: ${E2E_RUNNER_IMAGE:?}
+    command: ["sleep", "infinity"]
+    init: true
+    networks: [e2e]
+
+  idp:
+    image: ${E2E_IDP_IMAGE:-quay.io/keycloak/keycloak:26.4}
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: e2e-keycloak-admin
+      KC_HOSTNAME: https://idp:8443
+      KC_HTTP_ENABLED: "false"
+      KC_HTTPS_PORT: "8443"
+      KC_HTTPS_CERTIFICATE_FILE: /certs/idp.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /certs/idp.key
+      KC_LOG_LEVEL: warn
+    volumes:
+      - ./keycloak/realm-e2e.json:/opt/keycloak/data/import/realm-e2e.json:ro
+      - ${E2E_WORKDIR:?}/certs:/certs:ro
+    networks:
+      e2e:
+        aliases: [idp]
+
+  jellyfin:
+    image: ${E2E_JELLYFIN_IMAGE:?}
+    network_mode: service:netns
+    depends_on: [netns]
+    environment:
+      # Trust the throwaway CA (bundle = image's CAs + e2e CA). Mounted over
+      # the system bundle as well, in case SSL_CERT_FILE is not honoured.
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      JELLYFIN_OIDC_ENABLED: ${E2E_OIDC_ENABLED:-true}
+      JELLYFIN_OIDC_ISSUER: ${E2E_OIDC_ISSUER-https://idp:8443/realms/e2e}
+      JELLYFIN_OIDC_CLIENT_ID: ${E2E_OIDC_CLIENT_ID-jellyfin}
+      JELLYFIN_OIDC_CLIENT_SECRET_FILE: /run/e2e/client-secret
+      JELLYFIN_OIDC_PROVIDER_NAME: E2E IdP
+      JELLYFIN_OIDC_ALLOWED_GROUPS: jellyfin-users,jellyfin-admins
+      JELLYFIN_OIDC_ADMIN_GROUPS: jellyfin-admins
+      JELLYFIN_OIDC_AUTO_CREATE_USERS: "true"
+      JELLYFIN_OIDC_LINK_EXISTING_BY_USERNAME: ${E2E_LINK_EXISTING:-false}
+      JELLYFIN_OIDC_DISABLE_PASSWORD_LOGIN: ${E2E_DISABLE_PASSWORD:-false}
+      JELLYFIN_OIDC_REDIRECT_BASE_URL: http://localhost:8096
+    volumes:
+      - config:/config
+      - cache:/cache
+      - ${E2E_WORKDIR:?}/certs/bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
+      - ${E2E_WORKDIR:?}/client-secret:/run/e2e/client-secret:ro
+
+  runner:
+    image: ${E2E_RUNNER_IMAGE:?}
+    profiles: [runner]
+    network_mode: service:netns
+    environment:
+      E2E_PHASE: ${E2E_PHASE:-}
+      E2E_RESULTS: /results
+    volumes:
+      - ${E2E_RESULTS_DIR:?}:/results
+      # Read-only view of Jellyfin's data dir, to check oidc-links.json.
+      - config:/jfconfig:ro
+
+volumes:
+  config:
+  cache:
+
+networks:
+  e2e:
+    name: ${E2E_PROJECT:?}

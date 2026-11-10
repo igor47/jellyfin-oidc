@@ -1,0 +1,162 @@
+{
+  "realm": "e2e",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": false,
+  "bruteForceProtected": false,
+  "accessTokenLifespan": 300,
+  "groups": [
+    {
+      "name": "jellyfin-users",
+      "path": "/jellyfin-users"
+    },
+    {
+      "name": "jellyfin-admins",
+      "path": "/jellyfin-admins"
+    }
+  ],
+  "users": [
+    {
+      "id": "00000000-0000-4000-a000-00000000a11c",
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@e2e.invalid",
+      "emailVerified": false,
+      "firstName": "Alice",
+      "lastName": "E2e",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "alice-password",
+          "temporary": false
+        }
+      ],
+      "groups": [
+        "/jellyfin-users",
+        "/jellyfin-admins"
+      ],
+      "requiredActions": []
+    },
+    {
+      "id": "00000000-0000-4000-a000-000000000b0b",
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@e2e.invalid",
+      "emailVerified": false,
+      "firstName": "Bob",
+      "lastName": "E2e",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "bob-password",
+          "temporary": false
+        }
+      ],
+      "groups": [
+        "/jellyfin-users"
+      ],
+      "requiredActions": []
+    },
+    {
+      "id": "00000000-0000-4000-a000-00000000ca10",
+      "username": "carol",
+      "enabled": true,
+      "email": "carol@e2e.invalid",
+      "emailVerified": false,
+      "firstName": "Carol",
+      "lastName": "E2e",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "carol-password",
+          "temporary": false
+        }
+      ],
+      "groups": [],
+      "requiredActions": []
+    },
+    {
+      "id": "00000000-0000-4000-a000-00000000da7e",
+      "username": "dave",
+      "enabled": true,
+      "email": "dave@e2e.invalid",
+      "emailVerified": false,
+      "firstName": "Dave",
+      "lastName": "E2e",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "dave-password",
+          "temporary": false
+        }
+      ],
+      "groups": [
+        "/jellyfin-users"
+      ],
+      "requiredActions": []
+    },
+    {
+      "id": "00000000-0000-4000-a000-00000000e214",
+      "username": "erin",
+      "enabled": true,
+      "email": "erin@e2e.invalid",
+      "emailVerified": false,
+      "firstName": "Erin",
+      "lastName": "E2e",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "erin-password",
+          "temporary": false
+        }
+      ],
+      "groups": [
+        "/jellyfin-users"
+      ],
+      "requiredActions": []
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "jellyfin",
+      "name": "jellyfin-oidc e2e",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "e2e-client-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:8096/oidc/callback",
+        "http://localhost:9/fixture-callback"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "+"
+      },
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true",
+            "claim.name": "groups"
+          }
+        }
+      ]
+    }
+  ]
+}
