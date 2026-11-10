@@ -1,0 +1,9 @@
+{
+  "name": "jellyfin-oidc-e2e",
+  "private": true,
+  "license": "GPL-2.0-only",
+  "type": "module",
+  "devDependencies": {
+    "@playwright/test": "1.65.0"
+  }
+}
