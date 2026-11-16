@@ -245,7 +245,12 @@ public class OidcClient
             ValidAudience = _options.ClientId,
             ValidateAudience = true,
             IssuerSigningKeys = keys,
-            ValidateIssuerSigningKey = true,
+
+            // The signature must verify against a key from the provider's JWKS (or the client secret, above).
+            // This flag only adds a check of the validity dates of a certificate attached to that key (x5c).
+            // Those dates are not part of OpenID Connect's trust model, and providers such as authentik keep
+            // signing with a self-signed certificate long after it has expired.
+            ValidateIssuerSigningKey = false,
             RequireSignedTokens = true,
             RequireExpirationTime = true,
             ValidateLifetime = true,

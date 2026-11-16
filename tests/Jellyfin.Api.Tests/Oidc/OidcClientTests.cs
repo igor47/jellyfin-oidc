@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Net.Http;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -99,6 +100,35 @@ public sealed class OidcClientTests : IDisposable
         Assert.Equal("user-1", identity.Subject);
         Assert.Equal("alice", identity.Username);
         Assert.Equal(new[] { "media", "admins" }, identity.Groups);
+    }
+
+    [Fact]
+    public async Task TokenSignedByKeyWithExpiredCertificate_IsAccepted()
+    {
+        // authentik publishes its signing key with the self-signed certificate attached (x5c) and keeps using it
+        // after the certificate has expired.
+        var request = new CertificateRequest("CN=expired signing certificate", _rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddYears(-3), DateTimeOffset.UtcNow.AddYears(-2));
+        var config = new OpenIdConnectConfiguration { Issuer = Issuer };
+        config.SigningKeys.Add(new X509SecurityKey(certificate, "k1"));
+        config.IdTokenSigningAlgValuesSupported.Add(SecurityAlgorithms.RsaSha256);
+
+        var claims = await _client.ValidateIdTokenAsync(config, ValidToken(), Nonce, CancellationToken.None);
+
+        Assert.Equal("user-1", claims.GetSingle("sub"));
+    }
+
+    [Fact]
+    public async Task TokenSignedByOtherKey_IsRejectedEvenWithCertificateKeys()
+    {
+        var request = new CertificateRequest("CN=signing certificate", _rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddYears(-3), DateTimeOffset.UtcNow.AddYears(-2));
+        var config = new OpenIdConnectConfiguration { Issuer = Issuer };
+        config.SigningKeys.Add(new X509SecurityKey(certificate, "k1"));
+        config.IdTokenSigningAlgValuesSupported.Add(SecurityAlgorithms.RsaSha256);
+        var token = Token(new RsaSecurityKey(_otherRsa) { KeyId = "k1" }, SecurityAlgorithms.RsaSha256, Claims());
+
+        await Assert.ThrowsAsync<OidcProtocolException>(() => _client.ValidateIdTokenAsync(config, token, Nonce, CancellationToken.None));
     }
 
     [Fact]
