@@ -21,6 +21,37 @@ Jellyfin; open an issue here instead.
 The design contract, including what the patch must and must not do, is in
 [DESIGN.md](DESIGN.md).
 
+## How this was written, and how far to trust it
+
+The patch, its tests and this automation were written by AI coding agents
+(Anthropic's Claude) working for the repository owner, who directed the design
+and runs the result on his own server. Read that as you would any other fact
+about who wrote authentication code you are about to expose to the internet.
+
+What has been done to check it:
+
+- Unit tests for the patch, and an end-to-end test that drives the stock web
+  client in a real browser against a real identity provider. No image is
+  published unless both pass ([How releases work](#how-releases-work)). The
+  end-to-end test is also run against stock Jellyfin to prove it can fail.
+- A separate AI review of the patch, done without access to the author's
+  reasoning. It found no way to log in without valid credentials, and several
+  problems in how identities map to accounts. Those were fixed and tested;
+  what remains by design is listed under [Security notes](#security-notes).
+- It runs in production against authentik for the owner's household.
+
+What has not been done:
+
+- No human security audit.
+- Real-world testing with identity providers other than authentik and
+  Keycloak (the test provider).
+- The `linux/arm64` image is built but has never been run.
+
+Every published image names the exact commit it was built from, and the patch
+is small: a few lines in upstream files plus new files under
+`Jellyfin.Api/Oidc/` on the `oidc/vX.Y` branches. Reading it is a realistic
+evening. Reports of anything wrong are welcome as issues.
+
 ## What is in this branch
 
 This `main` branch holds only the build and release automation. The server
