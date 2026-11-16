@@ -171,8 +171,14 @@ misconfig_case() {
       break
     fi
     if dc exec -T jellyfin curl -fsS -o /dev/null http://localhost:8096/health 2>/dev/null; then
-      verdict="fail: started and reports healthy"
-      break
+      # Jellyfin answers /health for a moment while it is still starting,
+      # before the configuration error stops it. Only a server that is still
+      # healthy a while later has really started.
+      sleep 15
+      if dc exec -T jellyfin curl -fsS -o /dev/null http://localhost:8096/health 2>/dev/null; then
+        verdict="fail: started and reports healthy"
+        break
+      fi
     fi
     sleep 2
   done
